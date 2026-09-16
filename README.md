@@ -13,8 +13,8 @@ clip(text)
 change_user(domain=None)
     Switch the current shell context user.
 
-cache_diff(env=None, reset=False)
-    Tracks new records and fields added to the cache during execution.
+cache_diff(env=None, reset=False, indent='    ')
+    Tracks both ORM field cache and ormcache entries added during execution.
 
 IrAttachment:
     json_read(self)
@@ -31,7 +31,7 @@ BaseModel:
         Formats a recordset into a list of tuples: [(id, display_name), ...]
     json_search(self, domain_or_fields=None, fields=None, view_type='list', limit=None, offset=0, order=None)
         Returns JSON representation
-        envy.ir_config_parameter.json_search("key like mail%").display()
+        envy.ir_config_parameter.json_search("key like mail%")
         envy.ir_config_parameter.all.json_search(["key", "value"])
     search(self, domain=None, *args, **kwargs)
         Modified search, i.e.:
@@ -39,5 +39,5 @@ BaseModel:
     select(self, msg=None, fields=None)
         Select a record out of a recordset. Returns in the `selected` global variable.
     xmlid
-        Syntactic sugar for ``record._get_external_ids()[record.id]``
+        Syntactic sugar for ``record._get_external_ids()[record.id]`` 
 ```
