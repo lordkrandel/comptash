@@ -3,6 +3,8 @@ Helpers for the `odoo-bin shell`
 
 Just run `odoo-bin shell --shell-file=comptash.py`
 
+<img width="904" height="835" alt="immagine" src="https://github.com/user-attachments/assets/c146b52b-c0df-40ca-a434-1db078954f58" />
+
 ```
 var(*args)
     unpacks globals into variables
