@@ -15,7 +15,6 @@ change_user(domain=None)
 
 cache_diff(env=None, reset=False)
     Tracks new records and fields added to the cache during execution.
-    Not implemented > saas-19.3
 
 IrAttachment:
     json_read(self)

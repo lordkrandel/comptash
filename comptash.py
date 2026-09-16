@@ -262,36 +262,85 @@ def clip(text):
 
 
 @contextmanager
-def cache_diff(env=None, reset=False):
-    """ Tracks new records and fields added to the cache during execution.
-        Not implemented > saas-19.3 """
-    if (envy.major > 19) or (envy.major == 19 and envy.minor > 3):
-        raise NotImplementedError("Sorry, still not available for this Odoo version")
-
+def cache_diff(env=None, reset=False, indent="    "):
+    """ Tracks both ORM field cache and ormcache entries added during execution. """
     env = env or self.env
+
+    is_modern = (envy.major > 19) or (envy.major == 19 and envy.minor > 3)
+
     if reset:
-        env.cache.invalidate_all()
-    before_keys = {
-        (field.model_name, record_id, field.name)
-        for field, field_cache in env.cache._data.items()
-        for record_id in field_cache
-    }
+        env.invalidate_all()
+        if is_modern and hasattr(env.transaction, 'ormcaches__'):
+            for cache_layer in env.transaction.ormcaches__.values():
+                if hasattr(cache_layer, 'clear'):
+                    cache_layer.clear()
+
+    def _snapshot():
+        snapshot = {}
+
+        if is_modern:
+            fields_obj = getattr(env.transaction, 'fields', getattr(env, '_fields_cache', None))
+            field_dict = getattr(fields_obj, '_cache', getattr(fields_obj, '_field_cache', {})) if fields_obj else {}
+
+            for key, val in field_dict.items():
+                if isinstance(key, tuple) and len(key) == 2:
+                    field, record_id = key
+                    snapshot["ORM", field.model_name, record_id, field.name] = val
+        else:
+            old_cache = getattr(env, '_cache', getattr(env, 'cache', None))
+            for field, field_cache in getattr(old_cache, '_data', {}).items():
+                for record_id, val in field_cache.items():
+                    snapshot["ORM", field.model_name, record_id, field.name] = val
+
+        # 2. Method LRU Caches (@ormcache)
+        if is_modern and hasattr(env.transaction, 'ormcaches__'):
+            for cache_name, cache_layer in env.transaction.ormcaches__.items():
+                cache_items = getattr(cache_layer, 'snapshot', cache_layer)
+                if hasattr(cache_items, 'items'):
+                    for key, val in cache_items.items():
+                        snapshot["METHOD", cache_name, key] = val
+
+        return snapshot
+
+    def _format_value(val):
+        if isinstance(val, set):
+            sorted_items = sorted(repr(x) for x in val)
+            return "{" + ", ".join(sorted_items) + "}"
+        return repr(val)
+
+    def _format_key(entry):
+        entry_type = entry[0]
+        if entry_type == "ORM":
+            _, model, rid, field_name = entry
+            return f"[ORM] {model}({rid}).{field_name}"
+        else:
+            _, cache_name, key = entry
+            formatted_items = []
+            for item in key:
+                if callable(item):
+                    formatted_items.append(f"<func {item.__module__}.{item.__qualname__}>")
+                else:
+                    formatted_items.append(repr(item))
+            key_str = f"({', '.join(formatted_items)})"
+            return f"[METHOD:{cache_name}] {key_str}"
+
+    before_snapshot = _snapshot()
     try:
         yield
     finally:
-        after_keys = {
-            (field.model_name, record_id, field.name)
-            for field, field_cache in env.cache._data.items()
-            for record_id in field_cache
-        }
-        new_entries = after_keys - before_keys
-        print(f"\n--- [CACHE DIFF: {len(new_entries)} new entries cached] ---")
-        new_entries_str = "\n".join(sorted(
-            f"    {model}({rid!s}).{f_name} = {val}"
-            for model, rid, f_name in new_entries
-            if (val := env.cache._data[env[model]._fields[f_name]][rid]))
-        )
-        print(new_entries_str)
+        after_snapshot = _snapshot()
+        new_keys = set(after_snapshot.keys()) - set(before_snapshot.keys())
+
+        sub_indent = indent * 2
+        print(f"\n--- [CACHE DIFF: {len(new_keys)} new entries cached] ---")
+        if not new_keys:
+            print(f"{indent}(No new cache entries)")
+        else:
+            for k in sorted(new_keys, key=lambda x: (x[0], str(x[1]))):
+                header = _format_key(k)
+                value_str = _format_value(after_snapshot[k])
+                print(f"{indent}{header}")
+                print(f"{sub_indent}= {value_str}\n")
 
 
 def _monkeypatch_cache(env=None):
