@@ -1,6 +1,5 @@
 # ruff: file-ignore [print,import-outside-top-level]
 
-import copy
 import inspect
 import json
 import re
@@ -10,27 +9,67 @@ import shutil
 import subprocess
 import sys
 from ast import literal_eval
+from datetime import datetime, date
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path  # ruff: ignore [unused-import]
+
 from IPython.core import ultratb
 from IPython.terminal.prompts import Prompts
 from pygments.token import Token
 
-import odoo
+import odoo  # ruff: ignore [unused-import]
 from odoo.addons.base.models.ir_attachment import IrAttachment
 from odoo.release import version_info
 
-self = locals().get('self')
+
+envy = None
+ipy = None
+BaseModel = None
+Field = None
+
 JSON_INDENT = 4
+HELPERS = {}
 
 
-class ShellObject:
-    env = self.env
+def _helper(target=None):
+    """Decorator supporting @_helper and @_helper(Class).
+       Registers tools into HELPERS and automatically monkeypatches target classes. """
+    def decorator(func):
+        # Unwrap property descriptors to access the underlying getter function name
+        if isinstance(func, property):
+            func_name = func.fget.__name__
+        else:
+            func_name = func.__name__
+
+        if target is None:
+            # Standalone functions (e.g. clip, j, var)
+            HELPERS[func_name] = func
+        else:
+            # Class-bound methods (e.g. BaseModel, IrAttachment)
+            class_name = target.__name__ if hasattr(target, '__name__') else str(target)
+            if class_name not in HELPERS:
+                HELPERS[class_name] = {}
+            HELPERS[class_name][func_name] = func
+
+            # Auto-monkeypatch onto the class if target is a model/type
+            if isinstance(target, type):
+                setattr(target, func_name, func)
+
+        return func
+
+    if callable(target) and not isinstance(target, type):
+        # Called as plain @_helper without arguments
+        func = target
+        target = None
+        return decorator(func)
+
+    return decorator
 
 
-class Envy(ShellObject):
-    def __init__(self, *args, **kwargs):
+class Envy:
+    def __init__(self, env, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.env = env
         self.commit = self.env.cr.commit
         self.rollback = self.env.cr.rollback
         self.major = int(str(version_info[0]).replace("saas~", ""))
@@ -52,22 +91,37 @@ class Envy(ShellObject):
         raise KeyError(name)
 
 
-def get_class(name):
+def _monkeypatch_cache(env=None):
+    env = env or envy.env
     if envy.major <= 18:
-        from odoo.fields import Field
-        from odoo.models import BaseModel
-    else:
-        from odoo.orm.fields import Field
-        from odoo.orm.models import BaseModel
-    return {
-        'Field': Field,
-        'BaseModel': BaseModel,
-    }.get(name)
+        type(env.cache).invalidate_all = env.invalidate_all
+
+
+def _monkeypatch_xmlid():
+    @_helper
+    @property
+    def xmlid(self):
+        """ Syntactic sugar for ``record._get_external_ids()[record.id]`` """
+        return next(iter(self._get_external_ids()[self.id]), None)
+
+
+def _monkeypatch_attachment_json():
+    @_helper(IrAttachment)
+    def json_read(self):
+        """Loads and parses the attachment's raw JSON content into a dictionary."""
+        return json.loads(self.raw)
+
+    @_helper(IrAttachment)
+    def json_write(self, dict_data, commit=True):
+        """Dumps a dictionary as formatted JSON into the attachment's raw content."""
+        self.write({
+            'raw': json.dumps(dict_data, indent=JSON_INDENT),
+            'mimetype': 'application/json',
+        })
 
 
 def _monkeypatch_get():
     """ ``__get__`` becomes ``mapped`` on multiple-records recordsets. """
-    Field = get_class('Field')
     __old___get__ = Field.__get__
 
     def _monkey___get__(self, record, *args, **kwargs):
@@ -76,28 +130,32 @@ def _monkeypatch_get():
         except ValueError:
             field_name = self.name.split('.')[-1]
             return record.mapped(field_name)
+
     Field.__get__ = _monkey___get__
 
 
-def _monkeypatch_spec(fields=None, view_type='list'):
-    def get_spec(self, fields, view_type):
-        if not envy.ir_module_module._get('web').state == 'installed':
-            raise NotImplementedError("Web module has to be installed to jsearch")
-        view = self.get_view(None, view_type)
-        spec = self._get_fields_spec(view)
-        if fields:
-            spec = {
-                k: copy.deepcopy(v)
-                for k, v in spec.items()
-                if k in fields
-            }
-        return spec
+def _monkeypatch_spec():
+    @_helper(BaseModel)
+    def spec(self, fields=None, view_type='list'):
+        """Generates a web view specification dictionary for the model's fields."""
+        if envy.ir_module_module._get('web').state != 'installed':
+            raise NotImplementedError("Web module has to be installed to use spec/jsearch")
 
-    BaseModel = get_class('BaseModel')
-    BaseModel.spec = get_spec
+        view = self.get_view(None, view_type)
+        spec_dict = self._get_fields_spec(view)
+
+        if fields:
+            return {
+                field: spec_dict.get(field, {})
+                for field in fields
+                if field in self._fields
+            }
+
+        return spec_dict
 
 
 def _monkeypatch_display():
+    @_helper(BaseModel)
     def display(self, fields=None, msg=None):
         """Formats a recordset into a list of tuples: [(id, display_name), ...]"""
         print(msg or '')
@@ -105,6 +163,7 @@ def _monkeypatch_display():
         for idx, (k, *v) in enumerate(choices, 1):
             print(f"    #{idx:<5} [{k:>6}] {', '.join(v)}")
 
+    @_helper(BaseModel)
     def describe(self, fields=None):
         """Serializes a recordset, showing given fields. """
         def describe_record(record):
@@ -113,8 +172,15 @@ def _monkeypatch_display():
             return [record.id] + ([record.display_name] if not fields else [record[field] for field in fields])
         return sorted(self.mapped(describe_record))
 
+    @_helper(BaseModel)
     def select(self, msg=None, fields=None):
-        """Select a record out of a recordset. Returns in the `selected` global variable."""
+        """Interactively selects a record from the recordset and updates the `selected` global variable."""
+        def input_ignore_history(msg):
+            result = input(msg)
+            last_idx = readline.get_current_history_length() - 1
+            readline.remove_history_item(last_idx)
+            return result
+
         global selected  # ruff: ignore [global-statement]
         self.display(fields=fields)
         while True:
@@ -128,20 +194,13 @@ def _monkeypatch_display():
             except (ValueError, KeyboardInterrupt, EOFError):
                 return None
 
-    BaseModel = get_class('BaseModel')
-    BaseModel.describe = describe
-    BaseModel.display = display
-    BaseModel.select = select
-
 
 def _monkeypatch_search():
-    """ use strings """
-    BaseModel = get_class('BaseModel')
     old_search = BaseModel.search
 
-    def _monkey_search(self, domain=None, *args, **kwargs):
-        """ Modified search, i.e.:
-            envy.ir_config_parameter.search('key like mail%').display() """
+    @_helper(BaseModel)
+    def search(self, domain=None, *args, **kwargs):
+        """Searches records with support for string domain queries (e.g. 'key like mail%')."""
         match domain:
             case None:
                 domain = []
@@ -155,11 +214,9 @@ def _monkeypatch_search():
                 pass
         return old_search(self, domain, *args, **kwargs)
 
-    def _monkey_json_search(self, domain_or_fields=None, fields=None, view_type='list', limit=None, offset=0, order=None):
-        """ Returns JSON representation
-            envy.ir_config_parameter.json_search("key like mail%")
-            envy.ir_config_parameter.all.json_search(["key", "value"])
-        """
+    @_helper(BaseModel)
+    def json_search(self, domain_or_fields=None, fields=None, view_type='list', limit=None, offset=0, order=None):
+        """Executes search_read and returns a JSON-serializable list of dictionary records."""
         def is_seq(x):
             return isinstance(x, tuple | list)
         domain = []
@@ -176,62 +233,51 @@ def _monkeypatch_search():
         domain = domain or ([('id', 'in', self.ids)] if self else [])
         return self.web_search_read(domain, spec, limit=limit, offset=offset, order=order)['records']
 
-    BaseModel.search = _monkey_search
-    BaseModel.json_search = _monkey_json_search
-
-    def _all(self):
-        """ Syntactic sugar for search([])"""
+    @_helper(BaseModel)
+    @property
+    def all(self):
+        """Syntactic sugar for search([])."""
         return self.search()
-
-    BaseModel.all = property(_all)
 
 
 def _monkeypatch_IPython():
     ultratb.VerboseTB._tb_highlight = "bg:#700000"
 
 
-class Filestore(ShellObject):
-    @classmethod
-    @property
-    def path(self):
-        return Path(odoo.tools.config.filestore(self.env.cr.dbname))
-
-    @classmethod
-    def orphans(cls, domain=None, include_folders=False):
-        attachments = cls.env['ir.attachment'].search(domain or [])
-        ir_attachment_files = {path for path in attachments.mapped("store_fname") if path}
-        filestore_files = {
-            str(path.relative_to(cls.path))
-            for path in Path(cls.path).glob('./**/*')
-            if path and (include_folders or not Path(path).is_dir())
-        }
-        return sorted(filestore_files - ir_attachment_files)
-
-    @classmethod
-    def content(cls, filenames, summary=2000, start=0, count=10):
-        if isinstance(filenames, str):
-            filenames = [filenames]
-        results = {}
-        for filename in filenames[start:start + count + 1]:
-            with open(cls.path / filename, "rb") as f:
-                content = repr(f.read())
-            if summary:
-                results[filename] = content[:summary]
-            else:
-                results[filename] = content
-        return results
-
-
 # ----------------------------------------------
 # TOOLS
 # ----------------------------------------------
 
-def var(*args):
-    """ unpacks globals into variables """
+@_helper
+def j(x, indent=JSON_INDENT):
+    """ Pretty-prints a json_dumps of an object """
+    def default_serializer(obj):
+        """ Fallback for types json.dumps doesn't handle natively. """
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, (set, tuple)):
+            return list(obj)
+        if hasattr(obj, "__dict__"):
+            return obj.__dict__
+        return str(obj)
+
+    print(json.dumps(x, indent=indent, default=default_serializer, ensure_ascii=False))
+
+
+@_helper
+def var(*args, value=None):
+    """Retrieves variables from ```globals```, or assigns a variable into globals and IPython ```user_ns```."""
+    if value:
+        globals()[args[0]] = value
+        if ipy:
+            ipy.user_ns[args[0]] = value
+        return
     return unpack(globals(), *args)
 
 
+@_helper
 def unpack(obj, *args):
+    """Unpacks specific attributes or keys from an object or dictionary by name."""
     def get(arg):
         return getattr(obj, args[0], None) or obj[arg]
     if len(args) > 1:
@@ -239,8 +285,9 @@ def unpack(obj, *args):
     return get(args[0])
 
 
+@_helper
 def clip(text):
-    """ Copy text to clipboard """
+    """ Copy text to clipboard. Requires clip tools in the PATH (i.e. ```xclip```) """
     if not isinstance(text, str):
         raise TypeError("You're trying to copy something which is not a string")
     match sys.platform:
@@ -262,6 +309,7 @@ def clip(text):
 
 
 @contextmanager
+@_helper
 def cache_diff(env=None, reset=False, indent="    "):
     """ Tracks both ORM field cache and ormcache entries added during execution. """
     env = env or self.env
@@ -343,19 +391,7 @@ def cache_diff(env=None, reset=False, indent="    "):
                 print(f"{sub_indent}= {value_str}\n")
 
 
-def _monkeypatch_cache(env=None):
-    env = env or self.env
-    if envy.major <= 18:
-        type(env.cache).invalidate_all = env.invalidate_all
-
-
-def input_ignore_history(msg):
-    result = input(msg)
-    last_idx = readline.get_current_history_length() - 1
-    readline.remove_history_item(last_idx)
-    return result
-
-
+@_helper
 def change_user(domain=None):
     """Switch the current shell context user."""
     global self  # ruff: ignore [global-statement]
@@ -371,60 +407,38 @@ def change_user(domain=None):
 
 
 def set_prompt():
-    env = self.env
-    if env and hasattr(env, "user"):
-        if ip := var('get_ipython')():
-            class OdooPrompt(Prompts):
-                def in_prompt_tokens(self, cli=None):
-                    return [
-                        (Token.Prompt, '['),
-                        (Token.PromptNum, f"{env.user.name}"),
-                        (Token.Prompt, ' | '),
-                        (Token.Keyword, f"{', '.join(env.user.company_ids.mapped('name'))}"),
-                        (Token.Prompt, '] In ['),
-                        (Token.PromptNum, str(self.shell.execution_count)),
-                        (Token.Prompt, ']: '),
-                    ]
-            ip.prompts = OdooPrompt(ip)
+    class OdooPrompt(Prompts):
+        def in_prompt_tokens(self, cli=None):
+            return [
+                (Token.Prompt, '['),
+                (Token.PromptNum, f"{envy.env.user.name}"),
+                (Token.Prompt, ' | '),
+                (Token.Keyword, f"{', '.join(envy.env.user.company_ids.mapped('name'))}"),
+                (Token.Prompt, '] In ['),
+                (Token.PromptNum, str(self.shell.execution_count)),
+                (Token.Prompt, ']: '),
+            ]
+
+    if envy and envy.env:
+        if ipy:
+            ipy.prompts = OdooPrompt(ipy)
         else:
-            user = self.env.user.describe()[0]
-            companies = self.env.companies.describe()
+            user = envy.env.user.describe()[0]
+            companies = envy.env.companies.describe()
             sys.ps1 = f"\nuser={user}\ncompanies={companies}\n>>> "
     else:
         sys.ps1 = ">>> "
 
 
-def _monkeypatch_xmlid():
-    BaseModel = get_class('BaseModel')
-
-    def xmlid(self):
-        """ Syntactic sugar for ``record._get_external_ids()[record.id]`` """
-        return next(iter(self._get_external_ids()[self.id]), None)
-
-    BaseModel.xmlid = property(xmlid)
-
-
-def _monkeypatch_attachment_json():
-    def json_read(self):
-        """ Loads the json content """
-        return json.loads(self.raw)
-
-    def json_write(self, dict_data, commit=True):
-        """ Dumps a dictionary inside the content """
-        self.write({
-            'raw': json.dumps(dict_data, indent=JSON_INDENT),
-            'mimetype': 'application/json',
-        })
-
-    IrAttachment.json_read = json_read
-    IrAttachment.json_write = json_write
+def _indent(level):
+    return ' ' * JSON_INDENT * level
 
 
 def setup_helpers(show=False):
     def printout(x, level=1):
         for k, v in x.items():
-            func_indent = f"{' ' * 4 * (level - 1)}"
-            indent = f"{' ' * 4 * level}"
+            func_indent = f"{_indent(level - 1)}"
+            indent = f"{_indent(level)}"
             if callable(v):
                 sig = inspect.signature(v)
                 print(f"{func_indent}{k.strip()}{sig}")
@@ -439,35 +453,40 @@ def setup_helpers(show=False):
                 print(f"{func_indent}{k.strip()}:")
                 printout(v, level + 1)
 
-    BaseModel = get_class('BaseModel')
-    HELPERS = {
-        'var': var,
-        'clip': clip,
-        'change_user': change_user,
-        'cache_diff': cache_diff,
-        'IrAttachment': {
-            'json_read': IrAttachment.json_read,
-            'json_write': IrAttachment.json_write,
-        },
-        'BaseModel': {
-            'all': BaseModel.all,
-            'describe': BaseModel.describe,
-            'display': BaseModel.display,
-            'json_search': BaseModel.json_search,
-            'search': BaseModel.search,
-            'select': BaseModel.select,
-            'xmlid': BaseModel.xmlid,
-        }
-    }
     for name, helper in HELPERS.items():
         if callable(helper):
-            globals()[name] = helper
+            var(name, value=helper)
     if show:
         printout(HELPERS)
 
 
-def main(envy):
+def _setup_globals():
+    if (get_ipy := var('get_ipython')) and (ip := get_ipy()):
+        var('ipy', value=ip)
+    if env := var('env'):
+        var('envy', value=Envy(env))
 
+    # We need to know the version from the `env` before we can import these """
+    def get_base_model():
+        if envy.major <= 18:
+            from odoo.models import BaseModel
+        else:
+            from odoo.orm.models import BaseModel
+        return BaseModel
+
+    def get_field_model():
+        if envy.major <= 18:
+            from odoo.fields import Field
+        else:
+            from odoo.orm.fields import Field
+        return Field
+
+    var('BaseModel', value=get_base_model())
+    var('Field', value=get_field_model())
+
+
+def main():
+    _setup_globals()
     _monkeypatch_get()
     _monkeypatch_search()
     _monkeypatch_spec()
@@ -482,5 +501,4 @@ def main(envy):
 
 
 if __name__ == '__main__':
-    envy = Envy()
-    main(envy)
+    main()
