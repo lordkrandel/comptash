@@ -102,8 +102,8 @@ def _monkeypatch_display():
         """Formats a recordset into a list of tuples: [(id, display_name), ...]"""
         print(msg or '')
         choices = self.describe(fields)
-        for idx, (k, v) in enumerate(choices, 1):
-            print(f"    #{idx:<5} [{k:>6}] {v}")
+        for idx, (k, *v) in enumerate(choices, 1):
+            print(f"    #{idx:<5} [{k:>6}] {', '.join(v)}")
 
     def describe(self, fields=None):
         """Serializes a recordset, showing given fields. """
