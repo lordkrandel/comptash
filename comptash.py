@@ -241,6 +241,9 @@ def _monkeypatch_search():
 
 def _monkeypatch_IPython():
     ultratb.VerboseTB._tb_highlight = "bg:#700000"
+    if ipy:
+        ipy.confirm_exit = False
+        ipy.display_completions = 'column'
 
 
 # ----------------------------------------------
