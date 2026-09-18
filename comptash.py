@@ -76,10 +76,9 @@ class Envy:
         self.minor = int(str(version_info[1]))
 
     def __dir__(self):
-        return [
-            k.replace('.', '_')
-            for k in self.env.registry
-        ]
+        attrs = set(super().__dir__())
+        attrs.update(model.replace('.', '_') for model in self.env.registry)
+        return list(attrs)
 
     def __getattr__(self, name):
         """ If the attribute is not in the class, search the registry """
@@ -87,8 +86,8 @@ class Envy:
         pattern = re.compile(f"^{pattern}$")
         for item in self.env.registry:
             if re.match(pattern, item):
-                return self.env.__getitem__(item)
-        raise KeyError(name)
+                return self.env[item]
+        raise AttributeError(f"'Envy' object has no attribute '{name}'")
 
 
 def _monkeypatch_cache(env=None):
